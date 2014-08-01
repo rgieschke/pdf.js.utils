@@ -31,15 +31,27 @@ function parseQueryString(query) {
   return params;
 }
 
+function isRef(obj) { return obj.hasOwnProperty("num"); }
+function isDict(obj) { return obj.hasOwnProperty("map"); }
+function isStream(obj) { return obj.hasOwnProperty("dict"); }
+function isArray(obj) { return obj instanceof Array; }
+function isName(obj) { return obj.hasOwnProperty("name"); }
+function isNum(obj) { return typeof obj === "number"; }
+function isBool(obj) { return typeof obj === "boolean"; }
+function isString(obj) { return typeof obj === "string"; }
+
 //
 // Walking
 //
 
-function StreamContents(stream) {
+function StreamContents(pdfDocument, stream, ref) {
+  this.pdfDocument = pdfDocument;
   this.stream = stream;
+  this.ref = ref;
 }
 
-function Node(obj, name, depth, ref) {
+function Node(pdfDocument, obj, name, depth, ref) {
+  this.pdfDocument = pdfDocument;
   this.obj = obj;
   this.name = name;
   this.depth = depth;
@@ -60,15 +72,15 @@ Node.prototype = {
       }
       for (var key in map) {
         var value = map[key];
-        children.push(new Node(value, key, depth));
+        children.push(new Node(this.pdfDocument, value, key, depth));
       }
       if (isStream(obj)) {
-        children.push(new Node(new StreamContents(obj), 'Contents', depth));
+        children.push(new Node(this.pdfDocument, new StreamContents(this.pdfDocument, obj, this.ref), 'Contents', depth));
       }
     } else if (isArray(obj)) {
       for (var i = 0, ii = obj.length; i < ii; i++) {
         var value = obj[i];
-        children.push(new Node(value, i, depth));
+        children.push(new Node(this.pdfDocument, value, i, depth));
       }
     }
     return children;
@@ -76,56 +88,66 @@ Node.prototype = {
 };
 
 function createWalker(data, root) {
-  var pdf = new PDFDocument(null, data);
-  pdf.parseStartXRef();
-  pdf.parse();
-  var xref = pdf.xref;
-  if (!root || root === 'trailer') {
-    root = xref.trailer;
-  } else {
-    var ref = new Ref(root.num, root.gen);
-    root = xref.fetch(ref);
-  }
-
-  function addChildren(node, nodesToVisit) {
-    var children = node.children;
-    for (var i = children.length - 1; i >= 0; i--) {
-      nodesToVisit.push(children[i]);
+  if (root && root !== 'trailer') root = { num: parseInt(root.num, 10), gen: parseInt(root.gen, 10) };
+  return PDFJS.getDocument(data).then(function (pdfDocument) {
+    pdfDocument._browser = { data: data };
+    if (!root || root === 'trailer') {
+      var rootPromise = pdfDocument.getRawObject('trailer');
+    } else {
+      var rootPromise = pdfDocument.getRawObject(root);
     }
-  }
 
-  function walk(nodesToVisit, visit) {
-    while (nodesToVisit.length) {
-      var currentNode = nodesToVisit.pop();
-      if (currentNode.depth > 20) {
-        throw new Error('Max depth exceeded.');
-      }
-
-      if (isRef(currentNode.obj)) {
-        var fetched = xref.fetch(currentNode.obj);
-        currentNode = new Node(fetched, currentNode.name, currentNode.depth, currentNode.obj);
-      }
-      var visitChildren = visit(currentNode, function (currentNode, visit) {
-        walk(currentNode.children.reverse(), visit);
-      }.bind(null, currentNode));
-
-      if (visitChildren) {
-        addChildren(currentNode, nodesToVisit);
+    function addChildren(node, nodesToVisit) {
+      var children = node.children;
+      for (var i = children.length - 1; i >= 0; i--) {
+        nodesToVisit.push(children[i]);
       }
     }
-  }
 
-  return {
-    start: function (visit) {
-      var node;
-      if (!ref) {
-        node = [new Node(root, 'Trailer', 0)];
-      } else {
-        node = [new Node(root, '', 0, ref)];
+    function walk(nodesToVisit, visit) {
+      function loop() {
+        if (nodesToVisit.length) {
+          var currentNode = nodesToVisit.pop();
+          if (currentNode.depth > 20) {
+            throw new Error('Max depth exceeded.');
+          }
+
+          if (isRef(currentNode.obj)) {
+            var currentNodePromise = pdfDocument.getRawObject(currentNode.obj).then(function (fetched) {
+              return new Node(currentNode.pdfDocument, fetched, currentNode.name, currentNode.depth, currentNode.obj);
+            });
+          } else {
+            var currentNodePromise = Promise.resolve(currentNode);
+          }
+
+          return currentNodePromise.then(function (currentNode) {
+            var visitChildren = visit(currentNode, function (currentNode, visit) {
+              walk(currentNode.children.reverse(), visit);
+            }.bind(null, currentNode));
+
+            if (visitChildren) {
+              addChildren(currentNode, nodesToVisit);
+            }
+          }).then(loop);
+        }
       }
-      walk(node, visit);
+      return loop();
     }
-  };
+
+    return rootPromise.then(function (rootRes) {
+      return {
+        start: function (visit) {
+          var node;
+          if (!root || root === 'trailer') {
+            node = [new Node(pdfDocument, rootRes, 'Trailer', 0)];
+          } else {
+            node = [new Node(pdfDocument, rootRes, '', 0, root)];
+          }
+          walk(node, visit);
+        }
+      };
+    });
+  });
 }
 
 //
@@ -225,17 +247,37 @@ HtmlPrint.prototype.visit = function (ul, node, walk) {
     var pre = document.createElement('pre');
     var a = document.createElement('a');
     a.textContent = 'download';
-    var bytes = obj.stream.getBytes();
-    var string = '';
-    for (var i = 0; i < bytes.length; i++) {
-      string += String.fromCharCode(bytes[i]);
-    }
-    a.href = 'data:;base64,' + btoa(string);
+    var aBytes;
+    obj.pdfDocument.getStreamBytes(obj.ref).then(function(bytes) {
+      aBytes = bytes;
+      a.href = URL.createObjectURL(new Blob([bytes]));
+    });
     a.addEventListener('click', function(event) {
       event.stopPropagation();
     });
     span.appendChild(a);
+
+    span.appendChild(document.createTextNode(' '));
+
+    try {
+      var a2 = document.createElement('a');
+      a2.textContent = 'downloadRaw';
+      var a2Array = obj.pdfDocument._browser.data.subarray(obj.stream.start, obj.stream.end);
+      var a2Blob = new Blob([a2Array]);
+      a2.href = URL.createObjectURL(a2Blob);
+      a2.addEventListener('click', function(event) {
+        event.stopPropagation();
+      });
+      span.appendChild(a2);
+    } catch (e) {
+      console.log(e);
+    }
+
     expando(span, li, pre, function () {
+      var string = '';
+      for (var i = 0; i < aBytes.length; i++) {
+        string += String.fromCharCode(aBytes[i]);
+      }
       pre.textContent = string;
     });
   }
@@ -255,25 +297,26 @@ function go(data) {
     var split = hashParams.root.split(',');
     root = { num: split[0], gen: split[1] };
   }
-  var w = createWalker(data, root);
 
-  var ul = document.getElementById('main');
-  if (ul) {
-    ul.textContent = '';
-  } else {
-    ul = document.createElement('ul');
-    ul.id = 'main';
-    document.body.appendChild(ul);
-  }
+  createWalker(data, root).then(function (w) {
+    var ul = document.getElementById('main');
+    if (ul) {
+      ul.textContent = '';
+    } else {
+      ul = document.createElement('ul');
+      ul.id = 'main';
+      document.body.appendChild(ul);
+    }
 
-  var hp = new HtmlPrint(ul);
-  w.start(hp.visit.bind(hp, hp.ul));
-  // var pp = new PrettyPrint();
-  // w.start(pp.visit.bind(pp));
-  // console.log(pp.out);
+    var hp = new HtmlPrint(ul);
+    w.start(hp.visit.bind(hp, hp.ul));
+    // var pp = new PrettyPrint();
+    // w.start(pp.visit.bind(pp));
+    // console.log(pp.out);
 
-  // Expand first level.
-  document.querySelector('.expando > span').click();
+    // Expand first level.
+    document.querySelector('.expando > span').click();
+  });
 }
 
 window.addEventListener('change', function webViewerChange(evt) {
