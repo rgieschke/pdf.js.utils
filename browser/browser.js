@@ -1,5 +1,160 @@
 'use strict';
 
+// Simple buffer implementation.
+var Buffer = function(size) {
+  if (size == null) {
+    size = 1024;
+  }
+  this.array = new Uint8Array(size);
+  return this.length = 0;
+};
+
+Buffer.prototype = {
+  ensureAvailable: function(length) {
+    var arrayNew, neededSize, newSize;
+    neededSize = this.length + length;
+    newSize = this.array.byteLength;
+    if (neededSize <= newSize) {
+      return;
+    }
+    while (neededSize > newSize) {
+      newSize *= 2;
+    }
+    arrayNew = new Uint8Array(newSize);
+    arrayNew.set(this.getArray(), 0);
+    this.array = arrayNew;
+  },
+  writeArray: function(array) {
+    if (array instanceof Buffer) {
+      array = array.getArray();
+    }
+    this.ensureAvailable(array.byteLength);
+    this.array.set(array, this.length);
+    this.length += array.byteLength;
+  },
+  writeNumBigEndian: function(num, numBytes) {
+    var i, _i, _ref;
+    if (numBytes == null) {
+      numBytes = 1;
+    }
+    if (numBytes * 8 > 32) {
+      throw new Error("NumBytes is too large.");
+    }
+    if (num < 0) {
+      throw new Error("Num must not be negative.");
+    }
+    if (num > Math.pow(2, numBytes * 8) - 1) {
+      throw new Error("Num is too large.");
+    }
+    this.ensureAvailable(numBytes);
+    for (i = _i = _ref = numBytes - 1; _ref <= 0 ? _i <= 0 : _i >= 0; i = _ref <= 0 ? ++_i : --_i) {
+      this.array[this.length++] = (num >>> i * 8) & 0xff;
+    }
+  },
+  writeStringLatin1: function(str) {
+    var i, _, _i, _len;
+    this.ensureAvailable(str.length);
+    for (i = _i = 0, _len = str.length; _i < _len; i = ++_i) {
+      _ = str[i];
+      this.array[this.length++] = str.charCodeAt(i);
+    }
+  },
+  getByteLength: function() {
+    return this.length;
+  },
+  getArray: function() {
+    return this.array.subarray(0, this.length);
+  }
+};
+// End buffer.
+
+var crc32Worker = new Worker("./crc32.worker.js");
+var callbacks = {};
+var callbackNextId = 1;
+
+crc32Worker.onmessage = function (ev) {
+  if (ev.data.callbackId && (ev.data.callbackId in callbacks)) {
+    var callback = callbacks[ev.data.callbackId];
+    delete callbacks[ev.data.callbackId];
+    (callback[0])(ev.data.crc32);
+  }
+}
+
+function crc32Promise(data) {
+  return new Promise(function (resolve, reject) {
+    var callbackId = callbackNextId++;
+    var obj = { data: data, callbackId: callbackId };
+    callbacks[callbackId] = [resolve, reject];
+    crc32Worker.postMessage(obj);
+  });
+}
+
+function writeChunkPromise(buffer, data) {
+  // Length field does not include 4-byte chunk-type field.
+  buffer.writeNumBigEndian(data.length-4, 4);
+  buffer.writeArray(data);
+  if (data instanceof Buffer) {
+    var array = data.getArray();
+  } else {
+    var array = data;
+  }
+  return crc32Promise(array).then(function (crc32) {
+    buffer.writeNumBigEndian(crc32, 4);
+  });
+}
+
+var PNGSignature = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+
+function generatePNG(obj, pdfData) {
+  var data = pdfData.subarray(obj.start, obj.end);
+  var buffer = new Buffer();
+  buffer.writeArray(PNGSignature);
+
+  // Cf. <http://www.w3.org/TR/PNG/#11IHDR>.
+  var width = obj.dict.map.Width;
+  var height = obj.dict.map.Height;
+  var bitDepth = obj.dict.map.BitsPerComponent;
+
+  var colour = 0;
+  switch (obj.dict.map.ColorSpace.name) {
+    case "DeviceGray":
+      colour = 0;
+    break;
+    case "DeviceRGB":
+      colour = 2;
+    break;
+  }
+
+  var header = new Buffer();
+  header.writeStringLatin1("IHDR");
+  header.writeNumBigEndian(width, 4);
+  header.writeNumBigEndian(height, 4);
+  header.writeNumBigEndian(bitDepth, 1);
+  header.writeNumBigEndian(colour, 1);
+  // The following are fixed for PDF.
+  header.writeNumBigEndian(0, 1); // Compression.
+  // Should also check obj.dict.map.DecodeParams.map.Predictor
+  // is in [10, 11, 12, 13, 14, 15].
+  header.writeNumBigEndian(0, 1); // Filter.
+  header.writeNumBigEndian(0, 1); // Interlace.
+
+  var end = new Buffer();
+  end.writeStringLatin1("IEND");
+
+  var dataBuffer = new Buffer();
+  dataBuffer.writeStringLatin1("IDAT");
+  dataBuffer.writeArray(data);
+
+  return writeChunkPromise(buffer, header).then(function () {
+    return writeChunkPromise(buffer, dataBuffer);
+  }).then(function () {
+    return writeChunkPromise(buffer, end);
+  }).then(function () {
+    var blob = new Blob([buffer.getArray()]);
+    return URL.createObjectURL(blob);
+  });
+}
+
 //
 // Helper functions.
 //
@@ -269,6 +424,30 @@ HtmlPrint.prototype.visit = function (ul, node, walk) {
         event.stopPropagation();
       });
       span.appendChild(a2);
+    } catch (e) {
+      console.log(e);
+    }
+
+    try {
+      if (obj.stream.dict.map.Subtype &&
+          obj.stream.dict.map.Subtype.name === 'Image' &&
+          obj.stream.dict.map.Filter &&
+          obj.stream.dict.map.Filter.name === 'FlateDecode') {
+        console.log("PNG");
+        span.appendChild(document.createTextNode(' '));
+
+        var a3 = document.createElement('a');
+        a3.textContent = 'downloadGeneratedPNG';
+        generatePNG(obj.stream, obj.pdfDocument._browser.data).then(
+          function (url) {
+            a3.href = url;
+          }
+        );
+        a3.addEventListener('click', function(event) {
+          event.stopPropagation();
+        });
+        span.appendChild(a3);
+      }
     } catch (e) {
       console.log(e);
     }
